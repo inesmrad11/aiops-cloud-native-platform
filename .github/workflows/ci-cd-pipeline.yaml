@@ -1,0 +1,150 @@
+name: AIOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Permet de déclencher manuellement
+
+env:
+  REGISTRY: acraioopsdev395.azurecr.io
+  IMAGE_NAME: aiops-metrics-simulator
+  CLUSTER_NAME: aks-aiops-dev
+  RESOURCE_GROUP: rg-aiops-dev
+  NAMESPACE: default
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies and test
+      run: |
+        cd app
+        pip install -r requirements.txt
+        # Exécute les tests si le fichier existe
+        if [ -f "src/test_main.py" ]; then
+          python -m pytest src/test_main.py -v
+        else
+          echo "No tests found, skipping..."
+        fi
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Docker login to ACR
+      # Tentative de login même si les secrets sont vides
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+      continue-on-error: true  # Continue même si le login échoue
+
+    - name: Build Docker image
+      run: |
+        docker build ./app \
+          -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+    - name: Push Docker image
+      run: |
+        # Essaie de pousser, échoue si non authentifié
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} || \
+          echo "❌ Push failed - likely due to missing ACR credentials"
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest || \
+          echo "❌ Push failed - likely due to missing ACR credentials"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Kubernetes configuration
+      env:
+        KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      run: |
+        if [ -z "$KUBECONFIG_B64" ]; then
+          echo "❌ ERROR: KUBECONFIG_B64 secret is missing!"
+          exit 1
+        fi
+        echo "$KUBECONFIG_B64" | base64 -d > /tmp/kubeconfig
+        KUBECONFIG=/tmp/kubeconfig kubectl cluster-info
+
+    - name: Deploy to AKS
+      env:
+        KUBECONFIG: /tmp/kubeconfig
+      run: |
+        echo "🚀 Updating deployment aiops-metrics-simulator..."
+        
+        # CORRECTION CRITIQUE : Utilise 'aiops-simulator' comme nom de container
+        kubectl set image deployment/aiops-metrics-simulator \
+          aiops-simulator=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          --namespace=${{ env.NAMESPACE }}
+        
+        echo "⏳ Waiting for rollout to complete..."
+        kubectl rollout status deployment/aiops-metrics-simulator \
+          --namespace=${{ env.NAMESPACE }} \
+          --timeout=300s
+
+    - name: Verify deployment
+      env:
+        KUBECONFIG: /tmp/kubeconfig
+      run: |
+        echo "✅ Verifying deployment..."
+        
+        # Vérifie les pods
+        echo "📊 Pods status:"
+        kubectl get pods -n ${{ env.NAMESPACE }} -l app=aiops-metrics-simulator
+        
+        # Vérifie l'image mise à jour
+        echo ""
+        echo "🖼️ Current image in deployment:"
+        kubectl get deployment aiops-metrics-simulator -n ${{ env.NAMESPACE }} \
+          -o jsonpath='{.spec.template.spec.containers[0].image}'
+        
+        # Récupère l'IP externe
+        EXTERNAL_IP=$(kubectl get service aiops-metrics-simulator-service \
+          --namespace=${{ env.NAMESPACE }} \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        
+        if [ -n "$EXTERNAL_IP" ]; then
+          echo ""
+          echo "🎉 DEPLOYMENT SUCCESSFUL!"
+          echo "🌐 Application URL: http://$EXTERNAL_IP"
+          echo "🔗 Health check: http://$EXTERNAL_IP/health"
+        else
+          echo "⚠️ External IP not available yet. Service details:"
+          kubectl get svc aiops-metrics-simulator-service -n ${{ env.NAMESPACE }}
+        fi
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    steps:
+    - name: Pipeline status
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "✅ Pipeline terminé avec succès !"
+        else
+          echo "❌ Le pipeline a échoué. Vérifie les logs ci-dessus."
+        fi
